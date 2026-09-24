@@ -9,7 +9,14 @@ TZ = 'Asia/Tashkent'  # O'zbekiston vaqti (UTC+5)
 
 async def init_db():
     global pool
-    pool = await asyncpg.create_pool(DATABASE_URL)
+    pool = await asyncpg.create_pool(
+        DATABASE_URL,
+        min_size=2,                            # doimiy ochiq connectionlar
+        max_size=10,                           # maksimal parallel connection
+        max_inactive_connection_lifetime=300,  # 5 daqiqada bo'sh connectionni yopish
+        command_timeout=30,                    # har query uchun 30s limit
+        timeout=10                             # connection olishga 10s kutish
+    )
 
     async with pool.acquire() as conn:
         # ----- Foydalanuvchilar -----
@@ -86,6 +93,14 @@ async def init_db():
                 PRIMARY KEY (user_id, sub_id)
             )
         ''')
+
+        # ======================== INDEKSLAR (tezlik uchun) ========================
+        await conn.execute('CREATE INDEX IF NOT EXISTS idx_users_last_activity ON users(last_activity DESC)')
+        await conn.execute('CREATE INDEX IF NOT EXISTS idx_users_first_start ON users(first_start DESC)')
+        await conn.execute('CREATE INDEX IF NOT EXISTS idx_users_referred_by ON users(referred_by)')
+        await conn.execute('CREATE INDEX IF NOT EXISTS idx_user_completed_subs_user ON user_completed_subs(user_id)')
+        await conn.execute('CREATE INDEX IF NOT EXISTS idx_mandatory_subs_active ON mandatory_subscriptions(is_active, current_count)')
+        await conn.execute('CREATE INDEX IF NOT EXISTS idx_videos_code ON videos(code)')
 
 
 # ======================== Foydalanuvchilar ========================
