@@ -500,7 +500,10 @@ async def _broadcast_task(msg, progress_msg, user_ids, total):
                 pass
     tasks = [asyncio.create_task(send_to_user(uid)) for uid in user_ids]
     await asyncio.gather(*tasks)
-    await progress_msg.edit_text(f"✅ Xabar {total} ta foydalanuvchiga yuborildi.")
+    try:
+        await progress_msg.edit_text(f"✅ Xabar {total} ta foydalanuvchiga yuborildi.")
+    except:
+        pass
 
 
 # ======================== Video qo'shish ========================
@@ -926,15 +929,39 @@ async def main():
         MessageHandler(filters.TEXT & ~filters.COMMAND & private_filter, handle_code)
     )
 
-    await bot_application.initialize()
+    # ======================== Retry bilan initialize ========================
+    max_retries = 10
+    for attempt in range(1, max_retries + 1):
+        try:
+            print(f"🔄 Initialize urinish {attempt}/{max_retries}...")
+            await bot_application.initialize()
+            print("✅ Initialize muvaffaqiyatli")
+            break
+        except Exception as e:
+            print(f"⚠️ Initialize xatosi ({attempt}/{max_retries}): {e}")
+            if attempt == max_retries:
+                print("❌ Barcha urinishlar muvaffaqiyatsiz. Chiqilmoqda.")
+                raise
+            wait = min(5 * attempt, 30)
+            print(f"⏳ {wait} soniyadan keyin qayta urinish...")
+            await asyncio.sleep(wait)
 
-    # ======================== Webhookni sozlash ========================
-    await bot_application.bot.set_webhook(
-        url=WEBHOOK_URL,
-        drop_pending_updates=True,
-        allowed_updates=["message", "callback_query"]
-    )
-    
+    # ======================== Retry bilan webhook o'rnatish ========================
+    for attempt in range(1, 6):
+        try:
+            await bot_application.bot.set_webhook(
+                url=WEBHOOK_URL,
+                drop_pending_updates=True,
+                allowed_updates=["message", "callback_query"]
+            )
+            print("✅ Webhook o'rnatildi")
+            break
+        except Exception as e:
+            print(f"⚠️ Webhook o'rnatishda xato ({attempt}/5): {e}")
+            if attempt == 5:
+                raise
+            await asyncio.sleep(5)
+
     # Webhook holatini tekshirish
     try:
         info = await bot_application.bot.get_webhook_info()
