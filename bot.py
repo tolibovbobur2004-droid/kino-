@@ -2,6 +2,7 @@ import os
 import asyncio
 import secrets
 import time
+import httpx
 from starlette.applications import Starlette
 from starlette.responses import JSONResponse
 from starlette.routing import Route
@@ -27,6 +28,7 @@ from database import (
 
 load_dotenv()
 
+
 # ======================== safe_task ========================
 def safe_task(coro):
     """Background tasklarni xavfsiz ishga tushirish va xatolarni log qilish"""
@@ -38,6 +40,39 @@ def safe_task(coro):
             print(f"❌ Background task xatosi: {e}")
     task.add_done_callback(_log_exc)
     return task
+
+
+# ======================== GLOBAL CACHE'LAR (tezlik uchun) ========================
+_mandatory_cache = {"data": None, "timestamp": 0, "ttl": 60}
+_ad_cache = {"data": None, "timestamp": 0, "ttl": 120}
+_last_activity_cache = {}
+ACTIVITY_UPDATE_INTERVAL = 300
+
+
+async def get_cached_mandatory_subs():
+    now = time.time()
+    if _mandatory_cache["data"] is None or now - _mandatory_cache["timestamp"] > _mandatory_cache["ttl"]:
+        _mandatory_cache["data"] = await get_active_mandatory_subs()
+        _mandatory_cache["timestamp"] = now
+    return _mandatory_cache["data"]
+
+
+def invalidate_mandatory_cache():
+    _mandatory_cache["data"] = None
+    _mandatory_cache["timestamp"] = 0
+
+
+async def get_cached_ad():
+    now = time.time()
+    if _ad_cache["data"] is None or now - _ad_cache["timestamp"] > _ad_cache["ttl"]:
+        _ad_cache["data"] = await get_ad()
+        _ad_cache["timestamp"] = now
+    return _ad_cache["data"]
+
+
+def invalidate_ad_cache():
+    _ad_cache["data"] = None
+    _ad_cache["timestamp"] = 0
 
 
 # ======================== Doimiy majburiy obuna ========================
@@ -69,19 +104,65 @@ CHANNEL_USERNAME = "@kinomario_kino"
 CHANNEL_URL = "https://t.me/kinomario_kino"
 
 
+# ======================== SELF-PING (Render uxlamasligi uchun) ========================
+async def self_ping():
+    """Har 1 daqiqada o'z-o'ziga HTTP so'rov yuborib, Render'ni uyg'oq tutadi"""
+    await asyncio.sleep(30)  # Birinchi ping 30 soniyadan keyin
+    ping_count = 0
+    while True:
+        ping_count += 1
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(f"https://{RENDER_EXTERNAL_HOSTNAME}/healthcheck")
+                print(f"💓 Self-ping #{ping_count}: {resp.status_code} ({time.strftime('%H:%M:%S')})")
+        except Exception as e:
+            print(f"⚠️ Self-ping xatosi #{ping_count}: {e}")
+        
+        await asyncio.sleep(60)  # Har 1 daqiqada
+
+
+# ======================== WEBHOOK WATCHDOG ========================
+async def webhook_watchdog():
+    """Har 4 daqiqada webhook holatini tekshiradi va kerak bo'lsa qayta o'rnatadi"""
+    while True:
+        await asyncio.sleep(240)  # 4 daqiqa
+        try:
+            info = await bot_application.bot.get_webhook_info()
+            
+            if info.pending_update_count > 10 or info.last_error_message:
+                print(f"⚠️ Webhook muammosi: pending={info.pending_update_count}, error={info.last_error_message}")
+                await bot_application.bot.set_webhook(
+                    url=WEBHOOK_URL,
+                    drop_pending_updates=True,
+                    allowed_updates=["message", "callback_query"]
+                )
+                print("✅ Webhook qayta o'rnatildi")
+            else:
+                print(f"💚 Webhook sog'lom: pending={info.pending_update_count} ({time.strftime('%H:%M:%S')})")
+        except Exception as e:
+            print(f"⚠️ Watchdog xatosi: {e}")
+
+
 # ======================== Middleware: activity tracking ========================
 async def track_activity(update: Update, context: CallbackContext):
-    """Har qanday update kelganda last_activity ni yangilaydi"""
-    if update.effective_user:
-        try:
-            await update_last_activity(update.effective_user.id)
-        except Exception as e:
-            print(f"last_activity yangilashda xato: {e}")
+    """Har qanday update kelganda last_activity ni yangilaydi (5 daqiqada bir marta)"""
+    if not update.effective_user:
+        return
+    user_id = update.effective_user.id
+    now = time.time()
+    last = _last_activity_cache.get(user_id, 0)
+    if now - last < ACTIVITY_UPDATE_INTERVAL:
+        return
+    _last_activity_cache[user_id] = now
+    try:
+        await update_last_activity(user_id)
+    except Exception as e:
+        print(f"last_activity xatosi: {e}")
 
 
 # ======================== Reklama ========================
 async def send_ad(bot, chat_id):
-    ad = await get_ad()
+    ad = await get_cached_ad()
     if not ad:
         return
     content_type = ad["content_type"]
@@ -149,7 +230,7 @@ async def check_telegram_membership(bot, user_id, sub_data):
 # ======================== Majburiy obuna interfeysi ========================
 async def show_mandatory_subs(update: Update, context: CallbackContext):
     user_id = update.effective_user.id
-    subs = await get_active_mandatory_subs()
+    subs = await get_cached_mandatory_subs()
     if not subs:
         return True
 
@@ -225,7 +306,7 @@ async def check_and_handle_mandatory_subs(update: Update, context: CallbackConte
                 return True
             return False
 
-    subs = await get_active_mandatory_subs()
+    subs = await get_cached_mandatory_subs()
     if not subs:
         context.user_data[cache_key] = False
         context.user_data[cache_time_key] = current_time
@@ -234,25 +315,35 @@ async def check_and_handle_mandatory_subs(update: Update, context: CallbackConte
     telegram_types = ["telegram", "group", "invite"]
 
     async def check_sub(sub):
-        already_completed = await is_user_completed_sub(user_id, sub["id"])
+        try:
+            already_completed = await is_user_completed_sub(user_id, sub["id"])
 
-        if sub["type"] in telegram_types:
-            result = await check_telegram_membership(context.bot, user_id, sub)
+            if sub["type"] in telegram_types:
+                result = await asyncio.wait_for(
+                    check_telegram_membership(context.bot, user_id, sub),
+                    timeout=5.0
+                )
 
-            if result is True:
-                if not already_completed:
-                    await mark_user_completed_sub(user_id, sub["id"])
-                return (sub, True)
-            elif result is False:
-                if already_completed:
-                    await set_user_completed_sub(user_id, sub["id"], False)
-                return (sub, False)
+                if result is True:
+                    if not already_completed:
+                        await mark_user_completed_sub(user_id, sub["id"])
+                    return (sub, True)
+                elif result is False:
+                    if already_completed:
+                        await set_user_completed_sub(user_id, sub["id"], False)
+                    return (sub, False)
+                else:
+                    return (sub, already_completed)
             else:
                 return (sub, already_completed)
-        else:
-            return (sub, already_completed)
+        except asyncio.TimeoutError:
+            print(f"⚠️ Obuna tekshirish timeout: {sub['identifier']}")
+            return (sub, False)
+        except Exception as e:
+            print(f"check_sub xatosi: {e}")
+            return (sub, False)
 
-    results = await asyncio.gather(*[check_sub(sub) for sub in subs])
+    results = await asyncio.gather(*[check_sub(sub) for sub in subs], return_exceptions=False)
 
     incomplete = []
     for sub, is_ok in results:
@@ -275,7 +366,7 @@ async def confirm_all_subs_callback(update: Update, context: CallbackContext):
     await query.answer()
     user_id = update.effective_user.id
 
-    subs = await get_active_mandatory_subs()
+    subs = await get_cached_mandatory_subs()
     if not subs:
         await query.edit_message_text("✅ Hech qanday majburiy obuna mavjud emas.")
         await start_after_subs(update, context)
@@ -294,13 +385,19 @@ async def confirm_all_subs_callback(update: Update, context: CallbackContext):
     telegram_types = ["telegram", "group", "invite"]
 
     async def check_single_sub(sub):
-        if sub["type"] in telegram_types:
-            result = await check_telegram_membership(context.bot, user_id, sub)
-            if result is None:
+        try:
+            if sub["type"] in telegram_types:
+                result = await asyncio.wait_for(
+                    check_telegram_membership(context.bot, user_id, sub),
+                    timeout=5.0
+                )
+                if result is None:
+                    return (sub, True)
+                return (sub, result)
+            else:
                 return (sub, True)
-            return (sub, result)
-        else:
-            return (sub, True)
+        except asyncio.TimeoutError:
+            return (sub, False)
 
     results = await asyncio.gather(*[check_single_sub(sub) for sub in still_incomplete])
 
@@ -325,6 +422,8 @@ async def confirm_all_subs_callback(update: Update, context: CallbackContext):
 
     for sub in still_incomplete:
         await mark_user_completed_sub(user_id, sub["id"])
+
+    invalidate_mandatory_cache()
 
     await query.edit_message_text("✅ Ajoyib! Barcha kanallarga obuna bo'lgansiz. Botdan foydalanishingiz mumkin!")
 
@@ -679,6 +778,7 @@ async def setad_get_content(update: Update, context: CallbackContext):
         return WAITING_AD_CONTENT
 
     await set_ad(content_type, file_id, text, caption)
+    invalidate_ad_cache()
     await update.message.reply_text(f"✅ Reklama saqlandi!\nTuri: {content_type}")
     return ConversationHandler.END
 
@@ -687,13 +787,14 @@ async def removead(update: Update, context: CallbackContext):
     if update.effective_user.id != ADMIN_ID:
         return
     await remove_ad()
+    invalidate_ad_cache()
     await update.message.reply_text("🗑️ Reklama o'chirildi.")
 
 
 async def adstats(update: Update, context: CallbackContext):
     if update.effective_user.id != ADMIN_ID:
         return
-    ad = await get_ad()
+    ad = await get_cached_ad()
     if ad:
         count = ad["send_count"]
         await update.message.reply_text(f"📊 Reklama {count} marta yuborilgan.")
@@ -727,6 +828,7 @@ async def add_mandatory(update: Update, context: CallbackContext):
         return
 
     await add_mandatory_subscription(sub_type, identifier, limit, chat_id)
+    invalidate_mandatory_cache()
 
     msg = f"✅ Qo'shildi: {sub_type} | {identifier} | limit: {limit}"
     if chat_id:
@@ -750,6 +852,7 @@ async def remove_mandatory(update: Update, context: CallbackContext):
             return
 
     await remove_mandatory_subscription(sub_id)
+    invalidate_mandatory_cache()
     await update.message.reply_text(f"✅ ID {sub_id} o'chirildi.")
 
 
@@ -814,10 +917,20 @@ async def handle_code(update: Update, context: CallbackContext):
 
 
 # ======================== Webhook ========================
+async def safe_process_update(update):
+    try:
+        await bot_application.process_update(update)
+    except Exception as e:
+        print(f"❌ process_update xatosi: {e}")
+
+
 async def webhook_handler(request: Request):
-    data = await request.json()
-    update = Update.de_json(data, bot_application.bot)
-    await bot_application.process_update(update)
+    try:
+        data = await request.json()
+        update = Update.de_json(data, bot_application.bot)
+        asyncio.create_task(safe_process_update(update))
+    except Exception as e:
+        print(f"❌ webhook_handler xatosi: {e}")
     return JSONResponse({"ok": True})
 
 
@@ -973,6 +1086,11 @@ async def main():
             print("✅ Webhook xatosiz ishlayapti")
     except Exception as e:
         print(f"⚠️ Webhook info olishda xatolik: {e}")
+
+    # ======================== SELF-PING + WATCHDOG ========================
+    asyncio.create_task(self_ping())
+    asyncio.create_task(webhook_watchdog())
+    print("💓 Self-ping (har 1 daqiqa) va watchdog (har 4 daqiqa) ishga tushdi")
 
     starlette_app = Starlette(debug=False, routes=[
         Route(WEBHOOK_PATH, webhook_handler, methods=["POST"]),
