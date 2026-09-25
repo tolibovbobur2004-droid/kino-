@@ -139,20 +139,29 @@ async def webhook_watchdog():
             print(f"⚠️ Watchdog xatosi: {e}")
 
 
-# ======================== Middleware: activity tracking ========================
+# ======================== ✅ TUZATILGAN Middleware: activity tracking ========================
 async def track_activity(update: Update, context: CallbackContext):
+    """
+    Har qanday xabar/callback da:
+    - Agar foydalanuvchi bazada yo'q bo'lsa → qo'shadi
+    - Agar bor bo'lsa → last_activity yangilaydi
+    """
     if not update.effective_user:
         return
-    user_id = update.effective_user.id
+    user = update.effective_user
+    if user.is_bot:
+        return
+    user_id = user.id
     now = time.time()
     last = _last_activity_cache.get(user_id, 0)
     if now - last < ACTIVITY_UPDATE_INTERVAL:
         return
     _last_activity_cache[user_id] = now
     try:
-        await update_last_activity(user_id)
+        # ✅ TUZATILDI: register_user_start — yangi bo'lsa qo'shadi, eski bo'lsa last_activity yangilaydi
+        await register_user_start(user_id)
     except Exception as e:
-        print(f"last_activity xatosi: {e}")
+        print(f"track_activity xatosi: {e}")
 
 
 # ======================== Reklama ========================
@@ -566,7 +575,7 @@ async def _broadcast_task(msg, progress_msg, user_ids, total):
         pass
 
 
-# ======================== Video qo'shish (TUZATILGAN) ========================
+# ======================== Video qo'shish ========================
 async def addvideo_start(update: Update, context: CallbackContext):
     if update.effective_user.id != ADMIN_ID:
         return ConversationHandler.END
@@ -1032,7 +1041,7 @@ async def main():
     bot_application.add_handler(CommandHandler("list_mandatory", list_mandatory, filters=private_filter))
     bot_application.add_handler(CallbackQueryHandler(confirm_all_subs_callback, pattern="^confirm_all_subs$"))
 
-    # ======================== addvideo ConversationHandler (TUZATILGAN) ========================
+    # ======================== addvideo ConversationHandler ========================
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("addvideo", addvideo_start, filters=private_filter)],
         states={
